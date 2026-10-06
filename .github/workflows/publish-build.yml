@@ -1,0 +1,63 @@
+name: Publish a pushed build
+
+# The game's code repo is private, so its CI cannot make releases here with its
+# own token. Instead it force-pushes a one-commit branch `incoming` holding
+# hebrew-voice-game.apk and build.txt (the CI run number), using a deploy key
+# that can write to this repo only. This workflow turns that push into the
+# release `build-N` - the one .../releases/latest/download/hebrew-voice-game.apk
+# serves and the app's own update check reads - then deletes the branch, so
+# APKs never pile up in this repo's history.
+
+on:
+  push:
+    branches: [incoming]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: incoming
+
+      - name: Check what was pushed
+        run: |
+          N=$(tr -cd '0-9' < build.txt)
+          test -n "$N"
+          test -f hebrew-voice-game.apk
+          size=$(stat -c %s hebrew-voice-game.apk)
+          echo "build $N, $((size / 1024 / 1024)) MB"
+          if [ "$size" -gt 30000000 ] || [ "$size" -lt 1000000 ]; then
+            echo "::error::unexpected APK size $size"; exit 1
+          fi
+          unzip -tq hebrew-voice-game.apk
+          echo "N=$N" >> "$GITHUB_ENV"
+
+      - name: Release build-N as latest
+        run: |
+          if gh release view "build-$N" -R "$REPO" >/dev/null 2>&1; then
+            echo "build-$N already released"
+          else
+            gh release create "build-$N" hebrew-voice-game.apk -R "$REPO" --latest \
+              --title "Build $N" \
+              --notes "Download hebrew-voice-game.apk and open it on an Android phone or tablet. It installs over any earlier build; the app also offers it from its grown-up settings."
+          fi
+          # keep the five newest builds; the link always points at the latest
+          gh release list -R "$REPO" --limit 100 --json tagName -q '.[].tagName' | grep '^build-' \
+            | sort -t- -k2 -n -r | tail -n +6 | while read -r tag; do
+              gh release delete "$tag" -R "$REPO" --yes --cleanup-tag
+            done
+
+      - name: Drop the incoming branch
+        if: always()
+        run: git push origin --delete incoming || true
